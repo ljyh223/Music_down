@@ -2,7 +2,7 @@
 use std::io::Cursor;
 use image::ImageFormat;
 use indexmap::IndexMap;
-
+use std::net::{TcpStream, SocketAddr};
 
 pub fn merged_lyric(lyric: String, tlyric: String) -> String {
     let lyric_t=lyric.to_owned().trim_end().to_string();
@@ -77,6 +77,25 @@ pub fn check_png(data:&Vec<u8>) ->Result<Vec<u8>, Box<dyn std::error::Error>>{
     let _ = png_image.write_to(&mut Cursor::new(&mut jpg_data), ImageFormat::Jpeg);
     return Ok(jpg_data);
     
+
+}
+pub fn is_port_open(port: u16) -> Result<bool, std::io::Error> {
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port)); // IPv4 loopback address
+
+    match TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)) {
+        Ok(_) => Ok(true), // If the connection succeeds, the port is open.
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::ConnectionRefused ||
+               error.kind() == std::io::ErrorKind::TimedOut {
+                Ok(false) // The connection was refused or timed out, so the port is likely closed.
+            } else {
+                Err(error) // Some other IO error occurred; return it.
+            }
+
+        },
+
+    }
 
 }
 

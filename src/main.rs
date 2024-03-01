@@ -24,6 +24,7 @@ pub struct Music {
     pub file_type: String,
 }
 pub struct MusicDownload {
+    pub playlist_pic_url: String,
     pub palylist_id: String,
     pub playlist_name: String,
     pub save_path: String,
@@ -49,17 +50,24 @@ impl HasKey for Value {
         }
     }
 }
-
+// 6904724287
 impl MusicDownload {
     pub fn new(_id: String) -> MusicDownload {
         let option: Value = serde_json::from_str(&fs::read_to_string("./option.json").unwrap())
             .expect("init json loads error");
 
         MusicDownload {
+            //歌单封面
+            playlist_pic_url: String::new(),
+            //id
             palylist_id: _id.clone(),
+            //歌单名字
             playlist_name: String::new(),
+            //保存路径
             save_path: option["music_path"].as_str().unwrap().to_string(),
+            //保存歌单信息的文件路径
             music_info_path: option["music_path"].as_str().unwrap().to_string() + &_id + ".json",
+            //下载参数
             option,
             //需要下载
             require_music: HashMap::new(),
@@ -68,23 +76,41 @@ impl MusicDownload {
             already_music: HashMap::new(),
         }
     }
-    pub fn init(&mut self) {
-        let argument = format!(
-            "{}app.js",
-            self.option["NeteaseCloudMusicApi_path"].as_str().unwrap()
-        );
-        let _cmd: std::process::Child = Command::new("node")
-            .arg(argument)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("shell run error");
+    //开启NeteaseCloudMusicApi
+    pub fn init(&mut self) -> bool {
+        return match utils::is_port_open(3000) {
+            Ok(_is_open) => {
+                println!("已开启NeteaseCloudMusicApi ==> true--1");
+                return true;
+            }
+
+            Err(_e) => {
+                if !Path::new(&self.option["NeteaseCloudMusicApi_path"].as_str().unwrap()).exists()
+                {
+                    println!("NeteaseCloudMusicApi 不存在, 请检查");
+                    return false;
+                }
+                let argument = format!(
+                    "{}app.js",
+                    self.option["NeteaseCloudMusicApi_path"].as_str().unwrap()
+                );
+                let _cmd: std::process::Child = Command::new("node")
+                    .arg(argument)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("shell run error");
+                println!("已开启NeteaseCloudMusicApi ==> true--2");
+                true
+            }
+        };
     }
     pub async fn run(&mut self) {
         let _ = self.get_song_list().await;
         println!("请记得结束node进程");
     }
     async fn get_song_list(&mut self) -> Result<(), reqwest::Error> {
+        //获取 所有的id
         let resp = reqwest::get(format!(
             "http://localhost:3000/playlist/detail?id={}",
             self.palylist_id
@@ -92,10 +118,14 @@ impl MusicDownload {
         .await?
         .json::<Value>()
         .await?;
-
+        //歌单 基本信息
         self.playlist_name = resp["playlist"]["name"].as_str().unwrap().to_string();
+        self.playlist_pic_url = resp["playlist"]["coverImgUrl"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
-        //收集
+        //收集 music 的基本信息
         let mut all_music: HashMap<String, Music> = HashMap::new();
         for i in 0..=resp["playlist"]["trackCount"].as_i64().unwrap() / 50 {
             let resp = reqwest::get(format!(
@@ -130,18 +160,20 @@ impl MusicDownload {
                     pic_url: _i["al"]["picUrl"].as_str().unwrap().to_string() + "?param=1400y1400",
                     singer: utils::sy_re(ars.join(",")),
                     album: _i["al"]["name"].as_str().unwrap().to_string(),
+                    //这两个下面补上
                     donw_url: String::new(),
                     file_type: String::new(),
                 };
                 all_music.insert(_i["id"].as_i64().unwrap().to_string(), music);
             }
         }
+
         self.all_music = all_music;
         println!("all_music {:#?}", &self.all_music.len());
 
-        //看看是否第一次下载，是否存在文件
+        //是否存在保存歌单信息的json文件
         if !Path::new(&self.music_info_path).exists() {
-            let _file = File::create(&self.music_info_path).expect("id file create error");
+            let _ = File::create(&self.music_info_path).expect("id file create error");
         }
         //打开
         let mut file = fs::File::open(&self.music_info_path).expect("msg");
@@ -159,23 +191,14 @@ impl MusicDownload {
             //变成hashmap<String,Music>,这玩意相当于已经下载的music
             self.already_music = sub_id.drain(..).map(|x| (x.id.to_owned(), x)).collect();
             //把所有的value 取出来再转成Vec
+        } else {
+            self.already_music = HashMap::new();
         }
-        let _am: Vec<Music> = self.all_music.values().into_iter().cloned().collect();
-        //将写入的json
-        let body: Value = json!({
-            "total" : self.all_music.len(),
-            "data" : _am
-        });
-
-        let write_body = serde_json::to_string(&body).unwrap();
-        //求补集
 
         self.require_music = diff_hashmap(&self.all_music, &self.already_music);
         println!("预计下载: {}", &self.require_music.len());
         if !self.require_music.is_empty() {
             let _ = self.down_song().await;
-            let mut file1 = fs::File::create(&self.music_info_path).expect("111");
-            let _ = file1.write_all(&write_body.as_bytes());
         } else {
             println!("没有需要下载的");
         }
@@ -185,29 +208,51 @@ impl MusicDownload {
     async fn down_song(&mut self) -> Result<(), reqwest::Error> {
         let client: reqwest::Client = reqwest::Client::new();
         //遍历出所有id
+        println!("down_song");
+
+        let mut file = std::fs::File::open(self.option["cookie_path"].as_str().unwrap()).unwrap();
+        let mut cookie = String::new();
+        file.read_to_string(&mut cookie).unwrap();
+        println!("cookie ==> {:#?}", cookie);
         let _ids: Vec<_> = self.require_music.keys().map(|x| x.to_owned()).collect();
         let resp = client
             .get(format!(
-                "http://localhost:3000/song/url?id={}",
+                "http://localhost:3000/song/url/v1?id={}&level=lossless",
                 _ids.join(",")
             ))
-            .header(
-                header::COOKIE,
-                fs::read_to_string(self.option["cookie_path"].as_str().unwrap())
-                    .unwrap()
-                    .as_str(),
-            )
+            .header(header::COOKIE, cookie.trim())
             .send()
             .await?
             .json::<Value>()
             .await?;
         //获取data中的所有id和下载url
+
         let mut data = HashMap::new();
         for i in resp["data"].as_array().unwrap() {
-            data.insert(
-                i["id"].as_i64().unwrap().to_string(),
-                i["url"].as_str().unwrap().to_string(),
-            );
+            if let Some(_value) = i.get("url").and_then(|v| v.as_str()) {
+                if i["url"].as_str().unwrap().to_string().pop().unwrap() != '.' {
+                    data.insert(
+                        i["id"].as_i64().unwrap().to_string(),
+                        i["url"].as_str().unwrap().to_string(),
+                    );
+                } else {
+                    println!(
+                        "下载连接异常 ==> {:#?} : {} url => {}",
+                        self.all_music[&i["id"].as_i64().unwrap().to_string()].name,
+                        i["id"].as_i64().unwrap().to_string(),
+                        i["url"].as_str().unwrap().to_string(),
+                    );
+                    data.insert(i["id"].as_i64().unwrap().to_string(), String::from("null"));
+                    continue;
+                }
+            } else {
+                println!(
+                    "下载连接不存在 ==> {:#?} : {}",
+                    self.all_music[&i["id"].as_i64().unwrap().to_string()].name,
+                    i["id"].as_i64().unwrap().to_string()
+                );
+                data.insert(i["id"].as_i64().unwrap().to_string(), String::from("null"));
+            }
         }
         let mut music = self.require_music.clone();
 
@@ -224,28 +269,31 @@ impl MusicDownload {
         }
 
         for (_id, _music) in music.iter() {
-            let name=utils::sy_re(_music.name.clone());
-            let filename = format!(
-                "{}/{}.{}",
-                self.playlist_name, name, _music.file_type
-            );
-            print!("{}",name);
-            let filepath = self.save_path.clone() + &filename;
+            let name = utils::sy_re(_music.name.clone());
+
+            // 拼接一下歌单名
+            let filepath_ex = self.save_path.clone() + &self.playlist_name;
+            //判断歌单文件是否存在
+            if !Path::new(&filepath_ex).exists() {
+                println!("path not exists");
+                create_dir_all(&filepath_ex).unwrap();
+            }
+            //完整路径
+            let filepath = format!("{}/{}.{}", filepath_ex, name, _music.file_type);
             //音乐数据
+            if _music.donw_url == "null" {
+                println!("{:#?} 检测到空url,已跳过", _music.name);
+                continue;
+            }
             let music_data = reqwest::get(_music.donw_url.to_string())
                 .await?
                 .bytes()
                 .await?;
-            //写入,创建子目录
-            if !Path::new(&self.save_path).exists() {
-                let path = Path::new(&filepath);
-                let prefix = path.parent().unwrap();
-                create_dir_all(prefix).unwrap();
-            }
+            // 音乐数据写入
             let mut file = File::create(&filepath).unwrap();
             let _ = file.write_all(&music_data);
             //编辑标签
-            let _ = self.edit_tag(&filepath, _music).await;
+            let _ = self.edit_tag(&filepath, _music, Some(true)).await;
 
             println!("{:#?} ==> 下载完成", _music.name);
         }
@@ -255,8 +303,14 @@ impl MusicDownload {
         &mut self,
         filename: &str,
         music: &Music,
+        auto_save: Option<bool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if music.file_type.eq("mp3") {
+        // println!("mate data :filename ==>{:#?}", &filename);
+        if !Path::new(filename).exists() {
+            println!("文件不存在 ==> {:#?}", filename);
+            return Ok(());
+        }
+        if music.file_type.eq("demoooooooo") {
             if !self.option["mp3"]
                 .as_object()
                 .unwrap()
@@ -285,12 +339,11 @@ impl MusicDownload {
                     .json::<Value>()
                     .await?;
                 let mut lyric = resp["lrc"]["lyric"].as_str().unwrap().to_string();
-
+                // 用户true
                 if self.option["mp3"]["translation"].as_bool().unwrap()
-                    && resp.has_key("pureMusic")
-                    && resp["pureMusic"].as_bool().unwrap()
                     && resp["tlyric"].has_key("lyric")
                     && resp["tlyric"]["lyric"].as_str().unwrap() != ""
+                    && (!resp.has_key("pureMusic") || !resp["pureMusic"].as_bool().unwrap())
                 {
                     lyric = utils::merged_lyric(
                         lyric,
@@ -323,7 +376,7 @@ impl MusicDownload {
                         Err(_) => todo!(),
                     }
                 }
-                // encoding=3, mime="image/jpeg", type=6, desc=u"Cover", data=pic_datav
+                // encoding=3, mime="image/jpeg", type=6, desc=u"Cover", data=pic_datavet file=fs::File(&oath);
                 let picture = Picture {
                     mime_type: String::from("image/jpeg"),
                     picture_type: PictureType::Media,
@@ -349,18 +402,21 @@ impl MusicDownload {
 
             //save
             tag.write_to_path(&filename, Version::Id3v23)?;
-        } else {
+        } else if music.file_type.eq("flac") {
             //
+            println!("mate data :filename ==>{:#?}", &filename);
             if !self.option["flac"]
                 .as_object()
                 .unwrap()
                 .values()
                 .all(|v| v.as_bool().unwrap())
             {
+                println!("flac all false");
                 return Ok(());
             }
 
             let mut tag = metaflac::Tag::read_from_path(&filename).unwrap();
+            println!("read flac");
 
             if self.option["flac"]["pic"].as_bool().unwrap() {
                 let mut data = reqwest::get(music.pic_url.to_string())
@@ -371,6 +427,7 @@ impl MusicDownload {
                 //部分图片返回的是png的数据，导致win音乐不可见预览图片，同时也无法读取到元数据，aimp正常
                 //png 第一位是137
                 if data.get(0).unwrap().to_owned() == 137 {
+                    println!("png to jpg");
                     //转换为jpg
                     match utils::check_png(&data) {
                         Ok(v) => data = v,
@@ -378,22 +435,24 @@ impl MusicDownload {
                     }
                 }
 
+                println!("flac image");
+
                 tag.add_picture("image/jpeg", Media, data);
             }
 
             let comment = tag.vorbis_comments_mut();
-
+            println!("flac vorbis_comments_mut");
             if self.option["flac"]["lyric"].as_bool().unwrap() {
                 let resp = reqwest::get(format!("http://localhost:3000/lyric/?id={}", music.id))
                     .await?
                     .json::<Value>()
                     .await?;
                 let mut lyric = resp["lrc"]["lyric"].as_str().unwrap().to_string();
-                if self.option["mp3"]["translation"].as_bool().unwrap()
-                    && resp.has_key("pureMusic")
-                    && resp["pureMusic"].as_bool().unwrap()
+
+                if self.option["flac"]["translation"].as_bool().unwrap()
                     && resp["tlyric"].has_key("lyric")
-                    && resp["tlyric"]["lyric"].as_str().unwrap() != "" 
+                    && resp["tlyric"]["lyric"].as_str().unwrap() != ""
+                    && (!resp.has_key("pureMusic") || !resp["pureMusic"].as_bool().unwrap())
                 {
                     //可选，合并译文
                     let _tlyric = resp["tlyric"]["lyric"].as_str().unwrap();
@@ -401,30 +460,78 @@ impl MusicDownload {
                 }
 
                 comment.set_lyrics(vec![lyric]);
+
+                println!("flag lyric");
             }
 
             if self.option["flac"]["title"].as_bool().unwrap() {
                 comment.set_album(vec![music.album.to_string()]);
+                println!("flac title");
             }
 
             if self.option["flac"]["artist"].as_bool().unwrap() {
                 comment.set_artist(vec![music.singer.to_string()]);
+                println!("flac artist");
             }
 
             tag.save().unwrap();
+            println!("flac write ok");
         }
-        self.already_music.insert(music.id.clone(), music.clone());
-        self.save_musin_info();
+        match auto_save {
+            Some(b) => {
+                if b {
+                    self.already_music.insert(music.id.clone(), music.clone());
+                    self.save_musin_info();
+                }
+            }
+            None => {}
+        }
+
         Ok(())
     }
 
     fn save_musin_info(&self) {
         let mut file = File::create(&self.music_info_path).expect("save music info :open error");
         let data: Vec<Music> = self.already_music.values().into_iter().cloned().collect();
-        let body = json!({"total":&self.already_music.len(),"data":data});
+        let body = json!({
+            "id":self.palylist_id,
+            "name":self.playlist_name,
+            "picUrl":self.playlist_pic_url,
+            "total" : self.already_music.len(),
+            "data" : data
+        });
         let _ = file.write_all(serde_json::to_string(&body).unwrap().as_bytes());
     }
+    pub async fn meta_complete(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            self.option["music_path"].as_str().unwrap().to_string() + &self.palylist_id + ".json";
+
+        println!("{:#?}", path);
+        if Path::new(&path).exists() {
+            let f = File::open(&path).unwrap();
+            let json: Value = serde_json::from_reader(f).unwrap();
+
+            if json.has_key("data") {
+                for i in json["data"].as_array().unwrap() {
+                    
+
+                    let filename1 = format!(
+                        "{}{}/{}.{}",
+                        self.save_path,
+                        json["name"].as_str().unwrap(),
+                        utils::sy_re(i["name"].as_str().unwrap().to_string()),
+                        i["file_type"].as_str().unwrap()
+                    );
+                    let music: Music = serde_json::from_value(i.clone()).unwrap();
+                    let _ = self.edit_tag(&filename1, &music, None).await;
+                    
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
 pub fn diff_hashmap(
     map1: &HashMap<String, Music>,
     map2: &HashMap<String, Music>,
@@ -442,16 +549,29 @@ pub fn diff_hashmap(
     }
     m
 }
-
+// 6904724287
+// 8677413940
 #[tokio::main]
 async fn main() {
-    let mut env = std::env::args();
+    let env: Vec<String> = std::env::args().collect();
     if env.len() == 1 {
         print!("Give me your id");
         return;
     }
-    let id = env.nth(1).unwrap();
-    let mut down = MusicDownload::new(id);
-    down.init();
-    down.run().await;
+    let id = &env[2];
+    let query = &env[1];
+    let mut down = MusicDownload::new(id.clone());
+    if !down.init() {
+        return;
+    }
+
+    match query.as_str() {
+        "down" => {
+            down.run().await;
+        }
+        "tag" => {
+            let _ = down.meta_complete().await;
+        }
+        _ => println!("无效函数"),
+    }
 }

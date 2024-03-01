@@ -1,7 +1,7 @@
 {
-    "music_path" : "C:/Users/jinchuan/Music/CloudMusic1/",
-    "cookie_path": "C:/Users/jinchuan/Music/test/cookie.txt",
-    "NeteaseCloudMusicApi_path": "E:/tools/other/NeteaseCloudMusicApi-4.9.0/",
+    "music_path" : "/home/ljyh/Music/netease_cloud_music/",
+    "cookie_path": "/home/ljyh/Music/netease_cloud_music/cookie.txt",
+    "NeteaseCloudMusicApi_path": "/home/ljyh/Documents/tools/other/NeteaseCloudMusicApi/",
     "mp3": {
         "title": true,
         "artist": true,
