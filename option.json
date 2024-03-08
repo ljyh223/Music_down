@@ -1,0 +1,24 @@
+{
+    "music_path" : "/home/ljyh/Music/netease_cloud_music/",
+    "cookie_path": "/home/ljyh/Music/netease_cloud_music/cookie.txt",
+    "NeteaseCloudMusicApi_path": "/home/ljyh/Documents/tools/other/NeteaseCloudMusicApi/",
+    "mp3": {
+        "title": true,
+        "artist": true,
+
+        "lyric": true,
+        "translation": true,
+        "pic": true
+        
+    },
+    "flac": {
+        "title": true,
+        "artist": true,
+
+        "lyric": true,
+        "translation": true,
+        "pic": true
+        
+    }
+
+}
