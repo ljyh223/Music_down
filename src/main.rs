@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::fs::{create_dir_all, File};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use tokio::sync::mpsc;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct Music {
     pub id: String,
@@ -35,6 +36,8 @@ pub struct MusicDownload {
     pub all_music: HashMap<String, Music>,
     //已
     pub already_music: HashMap<String, Music>,
+    pub completed_music_coutn: usize,
+    pub all_music_count: usize
 }
 
 trait HasKey {
@@ -73,6 +76,8 @@ impl MusicDownload {
             all_music: HashMap::new(),
             //已经下载
             already_music: HashMap::new(),
+            completed_music_coutn: 0,
+            all_music_count:0
         }
     }
     //开启NeteaseCloudMusicApi
@@ -213,6 +218,8 @@ impl MusicDownload {
         );
         if !self.require_music.is_empty() {
             let _ = self.down_song().await;
+            println!("正在嵌入标签");
+            self.all_music_count=self.all_music.len();
             let _ = self.meta_complete(Some(true)).await;
         } else {
             println!("{}", Colour::Yellow.paint("没有需要下载的"));
@@ -227,14 +234,14 @@ impl MusicDownload {
         let mut file = std::fs::File::open(self.option["cookie_path"].as_str().unwrap()).unwrap();
         let mut cookie = String::new();
         file.read_to_string(&mut cookie).unwrap();
-        // println!("cookie ==> {:#?}", cookie);
+        println!("{} ==> {:#?}",Colour::Green.paint("cookie"), cookie);
         let _ids: Vec<_> = self.require_music.keys().map(|x| x.to_owned()).collect();
         let resp = client
             .get(format!(
                 "http://localhost:3000/song/url/v1?id={}&level=lossless",
                 _ids.join(",")
             ))
-            .header(header::COOKIE, cookie.trim())
+            .header(header::COOKIE, format!("MUSIC_U={}",cookie.trim()))
             .send()
             .await?
             .json::<Value>()
@@ -242,34 +249,39 @@ impl MusicDownload {
         //获取data中的所有id和下载url
 
         let mut data = HashMap::new();
+
         for i in resp["data"].as_array().unwrap() {
+            //if url is null
+            let _id = i["id"].as_i64().unwrap().to_string();
             if let Some(_value) = i.get("url").and_then(|v| v.as_str()) {
-                if i["url"].as_str().unwrap().to_string().pop().unwrap() != '.' {
-                    data.insert(
-                        i["id"].as_i64().unwrap().to_string(),
-                        i["url"].as_str().unwrap().to_string(),
-                    );
+                let _url = i["url"].as_str().unwrap().to_string();
+                //And some abnormal links
+                if _url.clone().pop().unwrap() != '.' {
+                    data.insert(_id, _url);
                 } else {
                     println!(
                         "{} ==> {} : {} url -> {}",
                         Colour::Yellow.paint("下载链接异常"),
                         self.all_music[&i["id"].as_i64().unwrap().to_string()].name,
-                        i["id"].as_i64().unwrap().to_string(),
-                        i["url"].as_str().unwrap().to_string(),
+                        _id,
+                        _url,
                     );
-                    data.insert(i["id"].as_i64().unwrap().to_string(), String::from("null"));
+                    data.insert(_id, String::from("null"));
                     continue;
                 }
             } else {
                 println!(
                     "{} ==> {} -> {}",
                     Colour::Yellow.paint("下载连接不存在"),
-                    self.all_music[&i["id"].as_i64().unwrap().to_string()].name,
-                    i["id"].as_i64().unwrap().to_string()
+                    self.all_music[&_id].name,
+                    _id
                 );
-                data.insert(i["id"].as_i64().unwrap().to_string(), String::from("null"));
+                data.insert(_id, String::from("null"));
             }
         }
+        
+
+
         let mut music = self.require_music.clone();
 
         for (key, value) in &data {
@@ -284,19 +296,14 @@ impl MusicDownload {
             }
         }
 
-        for (_id, _music) in music.iter() {
-            let name = utils::sy_re(_music.name.clone());
-
-            // 拼接一下歌单名
-            let filepath_ex = self.save_path.clone() + &self.playlist_name;
-            //判断歌单文件是否存在
-            if !Path::new(&filepath_ex).exists() {
-                // println!("path not exists");
-                create_dir_all(&filepath_ex).unwrap();
-            }
-            //完整路径
-            let filepath = format!("{}/{}.{}", filepath_ex, name, _music.file_type);
-            //音乐数据
+        let filepath_ex = self.save_path.clone() + &self.playlist_name; // 拼接一下歌单名
+                                                                        //判断歌单文件是否存在
+        if !Path::new(&filepath_ex).exists() {
+            fs::create_dir_all(&filepath_ex).unwrap();
+        }
+        
+        let (tx, mut rx) = mpsc::channel::<Music>(self.require_music.len());
+        for (_id, _music) in music {
             if _music.donw_url == "null" {
                 println!(
                     "{}/{} 检测到空url,已跳过 ==> {} ",
@@ -306,26 +313,31 @@ impl MusicDownload {
                 );
                 continue;
             }
-            let music_data = reqwest::get(_music.donw_url.to_string())
-                .await?
-                .bytes()
-                .await?;
-            // 音乐数据写入
-            let mut file = File::create(&filepath).unwrap();
-            let _ = file.write_all(&music_data);
+            let name = utils::sy_re(_music.name.clone());
+            let filepath = format!("{}/{}.{}", &filepath_ex, name, _music.file_type);
+            let tx_copy = tx.clone();
+            tokio::spawn(async move  {
+                
+                let req = reqwest::get(_music.donw_url.to_string()).await.unwrap();
+                let content = req.bytes().await.unwrap();
 
-            self.already_music.insert(_music.id.clone(), _music.clone());
+                let mut file = File::create(&filepath).unwrap();
+                file.write_all(&content).unwrap();
+                tx_copy.send(_music.clone()).await.unwrap();
+            });
+        }
+        drop(tx);
+        while let Some(result) = rx.recv().await {
+            self.already_music.insert(result.id.clone(), result.clone());
             self.save_musin_info();
-
-            //编辑标签
-            // let _ = self.edit_tag(&filepath, _music, Some(true)).await;
             let info = format!(
                 "{}/{} 下载完成",
                 self.already_music.len(),
                 self.require_music.len()
             );
-            println!("{} ==> {}", Colour::Green.paint(info), _music.name);
+            println!("{} ==> {}", Colour::Green.paint(info), result.name);
         }
+        //-----
         Ok(())
     }
     async fn edit_tag(
@@ -334,7 +346,12 @@ impl MusicDownload {
         music: &Music,
         auto_save: Option<bool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // println!("mate data :filename ==>{:#?}", &filename);
+        let info = format!(
+            "{}/{} 嵌入标签",
+            self.completed_music_coutn + 1,
+            self.all_music_count
+        );
+        println!("{} ==> {}", Colour::Green.paint(info), &filename);
         if !Path::new(filename).exists() {
             println!("{} ==> {}", Colour::Yellow.paint("文件不存在"), filename);
             return Ok(());
@@ -410,18 +427,32 @@ impl MusicDownload {
                     mime_type: String::from("image/jpeg"),
                     picture_type: PictureType::Media,
                     description: String::from("Cover"),
-                    data,
+                    data: data.clone(),
+                };
+                tag.add_frame(Frame::with_content(
+                    "APIC",
+                    Content::Picture(picture.clone()),
+                ));
+                
+                let picture = Picture {
+                    mime_type: String::from("image/jpeg"),
+                    picture_type: PictureType::CoverFront,
+                    description: String::from("Cover"),
+                    data: data,
                 };
 
                 tag.add_frame(Frame::with_content(
                     "APIC",
                     Content::Picture(picture.clone()),
                 ));
+
+
             }
 
             //title
             if self.option["mp3"]["title"].as_bool().unwrap() {
                 tag.set_album(music.album.to_string());
+                tag.set_title(music.album.to_string())
             }
 
             //artist
@@ -458,13 +489,11 @@ impl MusicDownload {
                         Err(_) => todo!(),
                     }
                 }
-
-                if cfg!(target_os = "windows") {
-                    tag.add_picture("image/jpeg", Media, data);
-                } else if cfg!(target_os = "linux") {
-                    tag.add_picture("image/jpeg", CoverFront, data.clone());
-                    tag.add_picture("image/jpeg", Media, data);
+                tag.add_picture("image/jpeg", Media, data.clone());
+                if cfg!(target_os = "linux") {
+                    tag.add_picture("image/jpeg", CoverFront, data);
                 }
+                
             }
 
             let comment = tag.vorbis_comments_mut();
@@ -490,6 +519,7 @@ impl MusicDownload {
 
             if self.option["flac"]["title"].as_bool().unwrap() {
                 comment.set_album(vec![music.album.to_string()]);
+                comment.set_title(vec![music.album.to_string()])
             }
 
             if self.option["flac"]["artist"].as_bool().unwrap() {
@@ -508,6 +538,7 @@ impl MusicDownload {
             None => {}
         }
 
+        self.completed_music_coutn +=1;
         Ok(())
     }
 
@@ -530,6 +561,7 @@ impl MusicDownload {
         match already {
             Some(b) => {
                 if b {
+                    // let (tx, mut rx) = mpsc::channel::<Music>(self.require_music.len());
                     for (_, value) in self.already_music.clone() {
                         let filename1 = format!(
                             "{}{}/{}.{}",
@@ -549,7 +581,7 @@ impl MusicDownload {
                 if Path::new(&path).exists() {
                     let f = File::open(&path).unwrap();
                     let json: Value = serde_json::from_reader(f).unwrap();
-
+                    self.all_music_count=json["data"].as_array().unwrap().len();
                     //---------------
                     if json.has_key("data") {
                         for i in json["data"].as_array().unwrap() {
@@ -590,7 +622,7 @@ pub fn diff_hashmap(
     m
 }
 // 6904724287
-// 8677413940
+// 7314014613
 #[tokio::main]
 async fn main() {
     let env: Vec<String> = std::env::args().collect();
